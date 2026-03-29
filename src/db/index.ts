@@ -4,9 +4,9 @@ import postgres from "postgres";
 const connectionString = process.env.DATABASE_URL;
 
 if (!connectionString) {
-    throw new Error("DATABASE_URL environment variable is not set.");
+    console.warn("DATABASE_URL environment variable is not set. Database connection will fail.");
 }
 
 // Disable prefetch as it is not supported for "Transaction" pool mode
-const client = postgres(connectionString, { prepare: false });
+const client = postgres(connectionString || "postgres://localhost:5432/dummy", { prepare: false });
 export const db = drizzle(client);
