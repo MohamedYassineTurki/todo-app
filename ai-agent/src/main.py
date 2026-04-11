@@ -5,9 +5,15 @@ Collects metrics from a Dokploy instance, analyzes them with Google Gemini,
 and sends a daily health report to a Telegram channel.
 
 Environment variables are injected at runtime by Dokploy — no .env file is used.
+
+Dokploy API structure (confirmed from source):
+  GET /api/project.all → list of projects, each containing:
+    environments[] → each environment contains:
+      applications[], compose[], postgres[], mysql[], mongo[], mariadb[], redis[]
 """
 
 import os
+import time
 import requests
 from datetime import datetime, timezone
 from google import genai
@@ -27,101 +33,81 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # ---------------------------------------------------------------------------
 def collect_metrics() -> dict:
     """
-    Calls multiple Dokploy REST API endpoints to gather a snapshot of the
-    current state of all projects, applications, and databases.
+    Calls GET /api/project.all on the Dokploy instance to retrieve all projects
+    along with their nested services and databases.
 
-    Dokploy exposes tRPC-style REST endpoints:
-      - GET /api/project.all
-      - GET /api/application.all
-      - GET /api/postgres.all  /api/mysql.all  /api/mongo.all
+    The Dokploy API nesting structure is:
+      project → environments[] → {applications, compose, postgres, mysql,
+                                   mongo, mariadb, redis}
+
+    Applications carry an 'applicationStatus' field (idle/running/done/error).
+    Databases carry a 'applicationStatus' field as well.
 
     Returns a dictionary with:
         - projects:     list of project names
         - applications: list of dicts with 'name' and 'status'
         - databases:    list of dicts with 'name', 'type', and 'status'
-        - timestamp:    ISO-8601 UTC timestamp of when the data was collected
+        - timestamp:    ISO-8601 UTC timestamp of collection time
     """
     print("Collecting metrics from Dokploy...")
 
     headers = {
         "x-api-key": DOKPLOY_API_KEY,
-        "Content-Type": "application/json",
+        "accept": "application/json",
     }
     base = DOKPLOY_URL.rstrip("/")
+    url = f"{base}/api/project.all"
 
-    def _get(endpoint: str) -> list:
-        """Make a GET request to a Dokploy endpoint and return a list of items."""
-        url = f"{base}{endpoint}"
-        try:
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, list):
-                return data
-            # Handle wrapped responses
-            for key in ("items", "data", "result"):
-                if key in data and isinstance(data[key], list):
-                    return data[key]
-            return [data] if isinstance(data, dict) else []
-        except requests.RequestException as exc:
-            print(f"  WARNING: Failed to call {endpoint}: {exc}")
-            return []
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        raw_projects = response.json()
+        if not isinstance(raw_projects, list):
+            raw_projects = []
+    except requests.RequestException as exc:
+        print(f"  ERROR: Failed to call /api/project.all: {exc}")
+        raw_projects = []
 
-    # --- Projects ---
-    raw_projects = _get("/api/project.all")
-    projects = [p.get("name", "Unknown") for p in raw_projects]
-
-    # --- Applications ---
-    # Try /api/application.all first; if empty, extract services from each project
+    # --- Extract data from the nested structure ---
+    projects = []
     applications = []
-    raw_apps = _get("/api/application.all")
-    if raw_apps:
-        applications = [
-            {
-                "name": app.get("name", "Unknown"),
-                "status": app.get("applicationStatus", app.get("status", "unknown")),
-            }
-            for app in raw_apps
-        ]
-    else:
-        # Fallback: pull applications embedded in each project object
-        print("  INFO: /api/application.all not available, extracting from project data...")
-        for project in raw_projects:
-            for app in project.get("applications", []):
-                applications.append(
-                    {
-                        "name": app.get("name", "Unknown"),
-                        "status": app.get("applicationStatus", app.get("status", "unknown")),
-                    }
-                )
-
-    # --- Databases (Postgres, MySQL, Mongo) ---
     databases = []
-    db_endpoints = {
-        "postgres": "/api/postgres.all",
-        "mysql": "/api/mysql.all",
-        "mongo": "/api/mongo.all",
-    }
-    for db_type, endpoint in db_endpoints.items():
-        for db in _get(endpoint):
-            databases.append(
-                {
-                    "name": db.get("name", "Unknown"),
-                    "type": db_type,
-                    "status": db.get("databaseStatus", db.get("status", "unknown")),
-                }
-            )
-        # Also try pulling databases embedded in project data
-        if not databases:
-            for project in raw_projects:
-                for db in project.get(f"{db_type}s", []):
-                    databases.append(
-                        {
-                            "name": db.get("name", "Unknown"),
-                            "type": db_type,
-                            "status": db.get("databaseStatus", db.get("status", "unknown")),
-                        }
-                    )
+
+    for project in raw_projects:
+        projects.append(project.get("name", "Unknown"))
+
+        # Each project has an 'environments' list
+        for env in project.get("environments", []):
+
+            # Applications
+            for app in env.get("applications", []):
+                applications.append({
+                    "name": app.get("name", "Unknown"),
+                    "status": app.get("applicationStatus", "unknown"),
+                })
+
+            # Compose services (treated as applications)
+            for svc in env.get("compose", []):
+                applications.append({
+                    "name": svc.get("name", "Unknown") + " (compose)",
+                    "status": svc.get("composeStatus", svc.get("applicationStatus", "unknown")),
+                })
+
+            # Databases — Postgres, MySQL, Mongo, MariaDB, Redis
+            db_types = {
+                "postgres": env.get("postgres", []),
+                "mysql": env.get("mysql", []),
+                "mongo": env.get("mongo", []),
+                "mariadb": env.get("mariadb", []),
+                "redis": env.get("redis", []),
+            }
+            for db_type, db_list in db_types.items():
+                for db in db_list:
+                    databases.append({
+                        "name": db.get("name", "Unknown"),
+                        "type": db_type,
+                        "status": db.get("applicationStatus", "unknown"),
+                    })
 
     metrics = {
         "projects": projects,
@@ -194,7 +180,7 @@ Write a clear, concise daily server health report that includes:
 2. Status of each application — label it as ✅ Healthy or ❌ Has Issues.
 3. Status of each database — label it as ✅ Healthy or ❌ Has Issues.
 4. Any anomalies or services with "error" or "idle" or unexpected status.
-5. A short recommendation if anything looks wrong, or a confirmation that everything is fine.
+5. A short recommendation if anything looks wrong, or confirmation that everything is fine.
 
 Style rules:
 - Write for a Telegram message (plain text, no markdown headers like # or **).
@@ -210,33 +196,44 @@ Style rules:
 # ---------------------------------------------------------------------------
 def analyze_with_gemini(prompt: str) -> str:
     """
-    Sends the formatted prompt to the Google Gemini API using the new
-    google-genai SDK and returns the generated text response.
+    Sends the formatted prompt to the Google Gemini API using the google-genai
+    SDK and returns the generated text response.
 
-    Uses the gemini-2.0-flash model (current stable free-tier model).
+    Uses gemini-2.0-flash model. Retries once after 25 seconds if the API
+    returns a 429 rate-limit error (free tier allows retrying after ~20s).
 
     Args:
         prompt: The prompt string built by build_prompt().
 
     Returns:
         The AI-generated report as a plain string, or an error message string
-        if the API call fails.
+        if all attempts fail.
     """
     print("Calling Gemini for analysis...")
 
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-        )
-        report = response.text
-        print("  Gemini analysis received successfully.")
-        return report
-    except Exception as exc:
-        error_msg = f"⚠️ Gemini analysis failed: {exc}"
-        print(f"  ERROR: {error_msg}")
-        return error_msg
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    model = "gemini-2.0-flash"
+
+    for attempt in range(1, 3):  # Try up to 2 times
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            print("  Gemini analysis received successfully.")
+            return response.text
+
+        except Exception as exc:
+            error_str = str(exc)
+            # If rate-limited, wait and retry once
+            if "429" in error_str and attempt == 1:
+                print(f"  WARNING: Gemini rate limit hit. Waiting 25s before retry...")
+                time.sleep(25)
+                continue
+            # Any other error or retry also failed — return error message
+            error_msg = f"⚠️ Gemini analysis failed: {exc}"
+            print(f"  ERROR: {error_msg}")
+            return error_msg
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +243,11 @@ def send_to_telegram(report: str) -> None:
     """
     Sends the AI-generated report to the configured Telegram chat via the
     Telegram Bot API. Prepends a header line with the current date.
+
+    Common reasons for failure:
+      - 'chat not found': The TELEGRAM_CHAT_ID is wrong. For a private chat,
+        use your numeric user ID (get it from t.me/userinfobot). For a group/
+        channel, use the numeric ID like -1001234567890.
 
     Args:
         report: The text report to send (generated by analyze_with_gemini()).
@@ -264,9 +266,13 @@ def send_to_telegram(report: str) -> None:
 
     try:
         response = requests.post(url, json=payload, timeout=15)
-        # Print full error body so it's visible in Dokploy logs
         if not response.ok:
-            print(f"  ERROR: Telegram responded with {response.status_code}: {response.text}")
+            print(
+                f"  ERROR: Telegram responded with {response.status_code}: {response.text}\n"
+                f"  HINT: 'chat not found' usually means TELEGRAM_CHAT_ID is wrong.\n"
+                f"  HINT: For a private chat, get your numeric ID from @userinfobot on Telegram.\n"
+                f"  HINT: For a group/channel, the ID looks like -1001234567890."
+            )
         response.raise_for_status()
         print("  Report sent to Telegram successfully.")
     except requests.RequestException as exc:
