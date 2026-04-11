@@ -13,6 +13,7 @@ Dokploy API structure (confirmed from source):
 """
 
 import os
+import time
 import requests
 from datetime import datetime, timezone
 from google import genai
@@ -292,11 +293,16 @@ def send_to_telegram(report: str) -> None:
 # Main entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("=== AI Server Health Agent Starting ===")
+    print("=== AI Server Health Agent Started (runs every 24 hours) ===")
 
-    metrics = collect_metrics()
-    prompt = build_prompt(metrics)
-    report = analyze_with_gemini(prompt)
-    send_to_telegram(report)
+    while True:
+        print(f"\n--- Running report at {datetime.now(timezone.utc).isoformat()} ---")
 
-    print("=== Agent run complete ===")
+        metrics = collect_metrics()
+        prompt = build_prompt(metrics)
+        report = analyze_with_gemini(prompt)
+        send_to_telegram(report)
+
+        print("--- Report done. Sleeping for 24 hours... ---")
+        # Sleep 24 hours (86400 seconds) before the next run
+        time.sleep(86400)
