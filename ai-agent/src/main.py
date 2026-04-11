@@ -13,7 +13,6 @@ Dokploy API structure (confirmed from source):
 """
 
 import os
-import time
 import requests
 from datetime import datetime, timezone
 from google import genai
@@ -199,41 +198,49 @@ def analyze_with_gemini(prompt: str) -> str:
     Sends the formatted prompt to the Google Gemini API using the google-genai
     SDK and returns the generated text response.
 
-    Uses gemini-2.0-flash model. Retries once after 25 seconds if the API
-    returns a 429 rate-limit error (free tier allows retrying after ~20s).
+    Tries models in fallback order in case one has an exhausted quota:
+      1. gemini-2.0-flash
+      2. gemini-1.5-flash
+      3. gemini-1.5-flash-8b  (smallest model, highest free-tier quota)
 
     Args:
         prompt: The prompt string built by build_prompt().
 
     Returns:
         The AI-generated report as a plain string, or an error message string
-        if all attempts fail.
+        if all models fail.
     """
     print("Calling Gemini for analysis...")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    model = "gemini-2.0-flash"
 
-    for attempt in range(1, 3):  # Try up to 2 times
+    # Models listed from most capable to most quota-friendly
+    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+
+    for model in models:
         try:
+            print(f"  Trying model: {model}...")
             response = client.models.generate_content(
                 model=model,
                 contents=prompt,
             )
-            print("  Gemini analysis received successfully.")
+            print(f"  Gemini analysis received successfully using {model}.")
             return response.text
-
         except Exception as exc:
             error_str = str(exc)
-            # If rate-limited, wait and retry once
-            if "429" in error_str and attempt == 1:
-                print(f"  WARNING: Gemini rate limit hit. Waiting 25s before retry...")
-                time.sleep(25)
-                continue
-            # Any other error or retry also failed — return error message
+            if "429" in error_str or "quota" in error_str.lower():
+                print(f"  WARNING: {model} quota exhausted, trying next model...")
+                continue  # Try the next model
+            # Non-quota error — don't retry with other models
             error_msg = f"⚠️ Gemini analysis failed: {exc}"
             print(f"  ERROR: {error_msg}")
             return error_msg
+
+    # All models exhausted
+    error_msg = "⚠️ All Gemini models have exhausted their free-tier quota for today. The report will be sent tomorrow when the quota resets."
+    print(f"  ERROR: {error_msg}")
+    return error_msg
+
 
 
 # ---------------------------------------------------------------------------
