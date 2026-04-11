@@ -10,7 +10,7 @@ Environment variables are injected at runtime by Dokploy — no .env file is use
 import os
 import requests
 from datetime import datetime, timezone
-import google.generativeai as genai
+from google import genai
 
 # ---------------------------------------------------------------------------
 # Module-level constants — all sourced from Dokploy environment variables
@@ -30,6 +30,11 @@ def collect_metrics() -> dict:
     Calls multiple Dokploy REST API endpoints to gather a snapshot of the
     current state of all projects, applications, and databases.
 
+    Dokploy exposes tRPC-style REST endpoints:
+      - GET /api/project.all
+      - GET /api/application.all
+      - GET /api/postgres.all  /api/mysql.all  /api/mongo.all
+
     Returns a dictionary with:
         - projects:     list of project names
         - applications: list of dicts with 'name' and 'status'
@@ -38,20 +43,22 @@ def collect_metrics() -> dict:
     """
     print("Collecting metrics from Dokploy...")
 
-    headers = {"x-api-key": DOKPLOY_API_KEY}
+    headers = {
+        "x-api-key": DOKPLOY_API_KEY,
+        "Content-Type": "application/json",
+    }
     base = DOKPLOY_URL.rstrip("/")
 
-    # Helper: make a GET request to a Dokploy endpoint and return JSON safely
     def _get(endpoint: str) -> list:
+        """Make a GET request to a Dokploy endpoint and return a list of items."""
         url = f"{base}{endpoint}"
         try:
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             data = response.json()
-            # Some endpoints return a list directly, others wrap it in a key
             if isinstance(data, list):
                 return data
-            # Try common wrapper keys
+            # Handle wrapped responses
             for key in ("items", "data", "result"):
                 if key in data and isinstance(data[key], list):
                     return data[key]
@@ -65,14 +72,28 @@ def collect_metrics() -> dict:
     projects = [p.get("name", "Unknown") for p in raw_projects]
 
     # --- Applications ---
+    # Try /api/application.all first; if empty, extract services from each project
+    applications = []
     raw_apps = _get("/api/application.all")
-    applications = [
-        {
-            "name": app.get("name", "Unknown"),
-            "status": app.get("applicationStatus", "unknown"),
-        }
-        for app in raw_apps
-    ]
+    if raw_apps:
+        applications = [
+            {
+                "name": app.get("name", "Unknown"),
+                "status": app.get("applicationStatus", app.get("status", "unknown")),
+            }
+            for app in raw_apps
+        ]
+    else:
+        # Fallback: pull applications embedded in each project object
+        print("  INFO: /api/application.all not available, extracting from project data...")
+        for project in raw_projects:
+            for app in project.get("applications", []):
+                applications.append(
+                    {
+                        "name": app.get("name", "Unknown"),
+                        "status": app.get("applicationStatus", app.get("status", "unknown")),
+                    }
+                )
 
     # --- Databases (Postgres, MySQL, Mongo) ---
     databases = []
@@ -90,6 +111,17 @@ def collect_metrics() -> dict:
                     "status": db.get("databaseStatus", db.get("status", "unknown")),
                 }
             )
+        # Also try pulling databases embedded in project data
+        if not databases:
+            for project in raw_projects:
+                for db in project.get(f"{db_type}s", []):
+                    databases.append(
+                        {
+                            "name": db.get("name", "Unknown"),
+                            "type": db_type,
+                            "status": db.get("databaseStatus", db.get("status", "unknown")),
+                        }
+                    )
 
     metrics = {
         "projects": projects,
@@ -123,30 +155,24 @@ def build_prompt(metrics: dict) -> str:
     """
     print("Building prompt for Gemini...")
 
-    # Format projects
     projects_text = (
         "\n".join(f"  - {name}" for name in metrics["projects"])
-        if metrics["projects"]
-        else "  (none found)"
+        if metrics["projects"] else "  (none found)"
     )
 
-    # Format applications
     apps_text = (
         "\n".join(
             f"  - {app['name']}: {app['status']}" for app in metrics["applications"]
         )
-        if metrics["applications"]
-        else "  (none found)"
+        if metrics["applications"] else "  (none found)"
     )
 
-    # Format databases
     db_text = (
         "\n".join(
             f"  - [{db['type'].upper()}] {db['name']}: {db['status']}"
             for db in metrics["databases"]
         )
-        if metrics["databases"]
-        else "  (none found)"
+        if metrics["databases"] else "  (none found)"
     )
 
     prompt = f"""You are a DevOps assistant. Analyze the following server metrics collected from a Dokploy deployment platform and produce a daily health report.
@@ -184,8 +210,10 @@ Style rules:
 # ---------------------------------------------------------------------------
 def analyze_with_gemini(prompt: str) -> str:
     """
-    Sends the formatted prompt to the Google Gemini API (gemini-1.5-flash model)
-    and returns the generated text response.
+    Sends the formatted prompt to the Google Gemini API using the new
+    google-genai SDK and returns the generated text response.
+
+    Uses the gemini-2.0-flash model (current stable free-tier model).
 
     Args:
         prompt: The prompt string built by build_prompt().
@@ -197,9 +225,11 @@ def analyze_with_gemini(prompt: str) -> str:
     print("Calling Gemini for analysis...")
 
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
         report = response.text
         print("  Gemini analysis received successfully.")
         return report
@@ -234,6 +264,9 @@ def send_to_telegram(report: str) -> None:
 
     try:
         response = requests.post(url, json=payload, timeout=15)
+        # Print full error body so it's visible in Dokploy logs
+        if not response.ok:
+            print(f"  ERROR: Telegram responded with {response.status_code}: {response.text}")
         response.raise_for_status()
         print("  Report sent to Telegram successfully.")
     except requests.RequestException as exc:
@@ -246,16 +279,9 @@ def send_to_telegram(report: str) -> None:
 if __name__ == "__main__":
     print("=== AI Server Health Agent Starting ===")
 
-    # Step 1: Gather server data from Dokploy
     metrics = collect_metrics()
-
-    # Step 2: Format the data into an analysis prompt
     prompt = build_prompt(metrics)
-
-    # Step 3: Ask Gemini to analyze and generate the report
     report = analyze_with_gemini(prompt)
-
-    # Step 4: Deliver the report to Telegram
     send_to_telegram(report)
 
     print("=== Agent run complete ===")
