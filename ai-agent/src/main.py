@@ -214,8 +214,10 @@ def analyze_with_gemini(prompt: str) -> str:
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # Models listed from most capable to most quota-friendly
-    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+    # Models listed from most capable to most quota-friendly.
+    # Source: https://ai.google.dev/gemini-api/docs/models (April 2026)
+    # gemini-2.0-flash and gemini-1.5-flash are deprecated and removed.
+    models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
     for model in models:
         try:
